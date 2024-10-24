@@ -1,0 +1,89 @@
+pipeline {
+    agent any
+
+    environment {
+        // Define GCP project-specific variables
+        PROJECT_ID = 'your-gcp-project-id'       // Replace with your actual GCP project ID
+        GCR_HOST = 'gcr.io'
+        IMAGE_NAME = 'your-app-name'             // Replace with your app's Docker image name
+        CLOUD_RUN_SERVICE = 'your-cloud-run-service-name'  // Replace with your Cloud Run service name
+        REGION = 'us-central1'                   // Replace with your preferred region
+    }
+
+    parameters {
+        string(name: 'ACTION', defaultValue: 'deploy', description: 'Choose "deploy" for new deployment or "rollback" to rollback to a previous image')
+        string(name: 'IMAGE_TAG', defaultValue: '', description: 'Specify the Docker image tag for rollback (Leave empty if deploying a new version)')
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                // Checkout the repository containing your application code
+                git 'https://your-repo-url' // Replace with the actual URL of your application repository
+            }
+        }
+        stage('Build Docker Image') {
+            when {
+                expression { return params.ACTION == 'deploy' }  // Only build image for new deployments
+            }
+            steps {
+                script {
+                    def commitHash = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    def imageTag = "${env.GCR_HOST}/${env.PROJECT_ID}/${env.IMAGE_NAME}:${commitHash}"
+
+                    // Build Docker image
+                    sh "docker build -t ${imageTag} ."
+
+                    // Push Docker image to GCR
+                    sh "docker push ${imageTag}"
+
+                    // Store the image tag for future rollback
+                    writeFile file: 'latest_image.txt', text: "${imageTag}"
+                    archiveArtifacts artifacts: 'latest_image.txt', fingerprint: true
+                }
+            }
+        }
+        stage('Deploy or Rollback to Cloud Run') {
+            steps {
+                script {
+                    def imageTag = ""
+
+                    // Handle Deploy vs Rollback logic
+                    if (params.ACTION == 'rollback') {
+                        // If rollback, use the provided IMAGE_TAG for deployment
+                        if (params.IMAGE_TAG.trim() == '') {
+                            error "Rollback action selected, but no IMAGE_TAG provided. Please specify a valid tag."
+                        }
+                        imageTag = "${env.GCR_HOST}/${env.PROJECT_ID}/${env.IMAGE_NAME}:${params.IMAGE_TAG}"
+                    } else {
+                        // Deploy the newly built image
+                        def commitHash = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                        imageTag = "${env.GCR_HOST}/${env.PROJECT_ID}/${env.IMAGE_NAME}:${commitHash}"
+                    }
+
+                    // Deploy to Cloud Run using gcloud
+                    sh """
+                    gcloud run deploy ${env.CLOUD_RUN_SERVICE} \
+                    --image ${imageTag} \
+                    --region ${env.REGION} \
+                    --platform managed \
+                    --allow-unauthenticated
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Clean up workspace after each run
+            cleanWs()
+        }
+        success {
+            echo 'Deployment successful!'
+        }
+        failure {
+            echo 'Deployment failed!'
+        }
+    }
+}
